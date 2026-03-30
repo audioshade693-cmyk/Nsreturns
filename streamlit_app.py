@@ -1,11 +1,11 @@
+import streamlit as st
 import pandas as pd
-import gradio as gr
-import openpyxl # Required by pandas for WRITING Excel
-import os # Required for reading secrets
-import requests # Required for SendGrid
-import re # Added for aggressive cleaning
+import os
+import requests
+import re
+from io import BytesIO
 
-# --- YOUR ORIGINAL CATEGORIZATION ---
+# --- CATEGORIZATION DATA ---
 categories = {
     'Grey Wired': {'skus': ['greywiredn7313', 'greywirednoe3121', 'greywirednoe912', 'greywirednoe5', 'greywired2', 'wirednewshopsy1', 'greywiredneo02', 'greywirednoe3112', 'greywired9323', 'greywiredflip1', 'wiregreyvbe3', 'wiredgreyneiw8213']},
     'Cable': {'skus': ['cable4inone', '4x1cable', 'cable4inone##', '4inonecable', 'cableshade242', 'cable4new', '4in1charging', 'flipcable', '4in1cableyelloww']},
@@ -26,201 +26,87 @@ categories = {
     'Map': {'skus': ['mapbuds']},
     'T800 WATCH': {'skus': ['watch111']}
 }
-# --- END OF CATEGORIZATION ---
 
-
-# --- Pre-process the categories to create a fast lookup map (SKU -> Category) ---
+# --- PRE-PROCESS MAP ---
 sku_to_category_map = {}
 for category, data in categories.items():
     for sku in data['skus']:
-        # ----- FIX: Remove all whitespace and make lowercase -----
         cleaned_key = re.sub(r'\s+', '', sku, flags=re.UNICODE).lower()
         sku_to_category_map[cleaned_key] = category
 
+# --- PAGE SETUP ---
+st.set_page_config(page_title="Flipkart Return Processor", layout="wide")
+st.title("📦 Flipkart Return Processor")
 
-# --- EMAIL FUNCTION (using SendGrid) ---
-def send_notification_email(summary_df_for_email, customer_return_total, courier_return_total, grand_total):
-    """
-    Sends a summary email using the SendGrid API.
-    Reads credentials from Hugging Face secrets.
-    The incoming DataFrame 'summary_df_for_email' should be the summary, not the detailed list.
-    """
-    sender_email = os.environ.get('SENDER_EMAIL')
-    sendgrid_api_key = os.environ.get('SENDER_PASSWORD') # This is your SendGrid API Key
-    recipient_email = os.environ.get('RECIPIENT_EMAIL')
+# --- EMAIL FUNCTION ---
+def send_email(summary_df, cust_total, cour_total, grand_total):
+    # Streamlit uses st.secrets instead of os.environ
+    try:
+        api_key = st.secrets["SENDER_PASSWORD"]
+        sender = st.secrets.get("SENDER_EMAIL", "nalt3224@gmail.com")
+        recipient = st.secrets.get("RECIPIENT_EMAIL", "nsworld003@gmail.com")
+    except:
+        return "⚠️ Secrets not configured in Streamlit Cloud."
 
-    if not sender_email:
-        sender_email = "nalt3224@gmail.com"
-    if not recipient_email:
-        recipient_email = "nsworld003@gmail.com"
-
-    if not sendgrid_api_key:
-        print("Email credentials (SendGrid 'SENDER_PASSWORD') not found. Skipping email.")
-        return "File processed, but email NOT sent. Reason: 'SENDER_PASSWORD' secret is not set in Hugging Face."
-    
-    subject = "Returns NS"
-    
-    # Create a version of the DataFrame for the email, excluding the Tracking_IDs
-    email_df = summary_df_for_email.drop(columns=['Tracking_IDs'], errors='ignore')
-
-    # Create the HTML body using the summary
+    email_df = summary_df.drop(columns=['Tracking_IDs'], errors='ignore')
     html_body = f"""
-    <html>
-    <head>
-    <style>
-        body {{ font-family: Arial, sans-serif; }}
-        table {{ border-collapse: collapse; width: 90%; }}
-        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-        th {{ background-color: #f2f2f2; }}
-    </style>
-    </head>
-    <body>
+    <html><body>
         <h2>Flipkart Return Summary</h2>
-        <p>Here is the summary of today's returns:</p>
-        <ul>
-            <li><b>Total Customer Returns:</b> {customer_return_total} units</li>
-            <li><b>Total Courier Returns:</b> {courier_return_total} units</li>
-            <li><b>Grand Total Returns:</b> {grand_total} units</li>
-        </ul>
-        <h3>Detailed Breakdown by Category (No Tracking IDs):</h3>
-        {email_df.to_html(index=False)} 
-    </body>
-    </html>
+        <p><b>Total Customer:</b> {cust_total} | <b>Total Courier:</b> {cour_total} | <b>Grand Total:</b> {grand_total}</p>
+        {email_df.to_html(index=False)}
+    </body></html>
     """
     
     url = "https://api.sendgrid.com/v3/mail/send"
-    headers = {"Authorization": f"Bearer {sendgrid_api_key}", "Content-Type": "application/json"}
-    
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     data = {
-        "personalizations": [{"to": [{"email": recipient_email}]}],
-        "from": {"email": sender_email},
-        "subject": subject,
+        "personalizations": [{"to": [{"email": recipient}]}],
+        "from": {"email": sender},
+        "subject": "Returns NS Summary",
         "content": [{"type": "text/html", "value": html_body}]
     }
 
+    response = requests.post(url, headers=headers, json=data)
+    return "✅ Email Sent!" if response.status_code < 300 else f"❌ Email Failed: {response.text}"
+
+# --- UI ---
+uploaded_file = st.file_uploader("Upload Flipkart CSV", type=['csv'])
+
+if uploaded_file:
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=30)
-        if 200 <= response.status_code < 300:
-            print(f"Notification email sent successfully! Status: {response.status_code}")
-            return "File processed AND email sent successfully!"
-        else:
-            print(f"EMAIL FAILED: Status: {response.status_code}, Body: {response.text}")
-            return f"File processed, but email FAILED. SendGrid Error: {response.text}"
-    except Exception as e:
-        print(f"Failed to send email: {e}")
-        return f"File processed, but email FAILED. Error: {str(e)}"
-
-# --- The Core Processing Function ---
-def process_return_file(uploaded_file):
-    """
-    Processes the uploaded Flipkart return file (CSV).
-    """
-    if uploaded_file is None:
-        raise gr.Error("Please upload a file first.")
-
-    try:
-        # --- 1. File Processing ---
-        # ----- Read as CSV with robust encoding detection -----
-        df = None
-        encodings_to_try = ['utf-8', 'utf-8-sig', 'cp1252', 'latin1'] # Removed utf-16 as it's less likely for this error
+        df = pd.read_csv(uploaded_file, encoding_errors='ignore')
         
-        for encoding in encodings_to_try:
-            try:
-                # Use engine='python' for flexibility
-                df = pd.read_csv(
-                    uploaded_file.name, 
-                    on_bad_lines='skip', 
-                    encoding=encoding,
-                    engine='python' 
-                )
-                print(f"File read successfully with encoding: {encoding}") 
-                break # If successful, stop trying
-            except (UnicodeDecodeError, pd.errors.ParserError, LookupError) as e:
-                print(f"Failed to read with encoding {encoding}: {e}")
-                continue # Try the next encoding
-
-        if df is None:
-            # If all encodings failed
-            raise gr.Error("Failed to parse the file. The file encoding is not supported or the file is corrupt. Please try re-downloading from Flipkart or re-saving as a CSV (UTF-8) in Excel/Google Sheets and try again.")
-        # ---------------------------------------------------------------------
-        
-        required_cols = ['Tracking ID', 'SKU', 'Quantity', 'Return Type']
-        missing_cols = [col for col in required_cols if col not in df.columns]
-        if missing_cols:
-            raise gr.Error(f"File is missing required columns: {', '.join(missing_cols)}. Found columns: {list(df.columns)}")
-
-        # --- 2. Data Cleaning and Transformation ---
+        # Data Cleaning
         df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce').fillna(0)
-        df['SKU'] = df['SKU'].astype(str) # Convert to string first
-        df['Return Type'] = df['Return Type'].astype(str).str.strip()
-        
-        # ----- AGGRESSIVE SKU CLEANING (from last time) -----
-        # Create a 'Clean_SKU' by removing ALL whitespace and making lowercase
-        df['Clean_SKU'] = df['SKU'].apply(lambda x: re.sub(r'\s+', '', x, flags=re.UNICODE).lower())
-        
-        # Map using the 'Clean_SKU' column
+        df['Clean_SKU'] = df['SKU'].astype(str).apply(lambda x: re.sub(r'\s+', '', x).lower())
         df['Category'] = df['Clean_SKU'].map(sku_to_category_map).fillna('Uncategorized')
-        
-        df['Simplified Return Type'] = df['Return Type'].apply(
-            lambda x: 'Courier Return' if x.lower() == 'courier_return' else 'Customer Return' # Made return type check case-insensitive
+        df['Return Type Clean'] = df['Return Type'].astype(str).str.lower().apply(
+            lambda x: 'Courier Return' if 'courier' in x else 'Customer Return'
         )
-        
-        # --- 3. Create Excel Output (Line-by-Line) ---
-        # We use the original 'SKU' column, which still has its original case
-        excel_df = df[['Category', 'Simplified Return Type', 'Tracking ID', 'SKU', 'Quantity']]
-        excel_df = excel_df.sort_values(by=['Category', 'Simplified Return Type', 'Tracking ID'])
-        
-        output_filename = "return_summary.xlsx"
-        excel_df.to_excel(output_filename, index=False, engine='openpyxl')
 
-        # --- 4. Create Summary for Email ---
-        grouped = df.groupby(['Category', 'Simplified Return Type'])
-        summary_df = grouped.agg(
-            Total_Quantity=('Quantity', 'sum')
-        ).reset_index()
-        summary_df = summary_df.sort_values(by=['Category', 'Simplified Return Type'])
+        # Summary calculations
+        summary = df.groupby(['Category', 'Return Type Clean'])['Quantity'].sum().reset_index()
+        cust_total = summary[summary['Return Type Clean'] == 'Customer Return']['Quantity'].sum()
+        cour_total = summary[summary['Return Type Clean'] == 'Courier Return']['Quantity'].sum()
         
-        # --- 5. Email Logic ---
-        customer_return_total = int(summary_df[summary_df['Simplified Return Type'] == 'Customer Return']['Total_Quantity'].sum())
-        courier_return_total = int(summary_df[summary_df['Simplified Return Type'] == 'Courier Return']['Total_Quantity'].sum())
-        grand_total = int(summary_df['Total_Quantity'].sum())
+        st.write("### Summary Report")
+        st.dataframe(summary)
 
-        email_status = send_notification_email(
-            summary_df, 
-            customer_return_total, 
-            courier_return_total, 
-            grand_total
+        # Export to Excel
+        output = BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df[['Category', 'Return Type Clean', 'Tracking ID', 'SKU', 'Quantity']].to_excel(writer, index=False)
+        
+        st.download_button(
+            label="📥 Download Detailed Excel",
+            data=output.getvalue(),
+            file_name="return_summary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-        
-        return output_filename, email_status
 
-    except pd.errors.ParserError:
-        raise gr.Error("Failed to parse the file. Please ensure it's a valid Excel or CSV file.")
+        if st.button("📧 Send Email Summary"):
+            status = send_email(summary, cust_total, cour_total, cust_total + cour_total)
+            st.info(status)
+
     except Exception as e:
-        # This will catch other errors
-        raise gr.Error(f"An error occurred: {str(e)}")
-
-# --- Create and Launch the Gradio App ---
-app = gr.Interface(
-    fn=process_return_file,
-    inputs=gr.File(
-        label="Upload Flipkart Return File (CSV or .xls)",
-        # ----- THIS IS THE MOBILE FIX -----
-        file_types=[".csv", ".xls"]
-        # ------------------------------------
-    ),
-    outputs=[
-        gr.File(label="Download Detailed Summary (Excel)"),
-        gr.Textbox(label="Email Status")
-    ],
-    title="Flipkart Return Processor",
-    description=(
-        "Upload your daily return Excel or CSV file from Flipkart. \n"
-        "The app will categorize SKUs, provide a detailed line-by-line Excel output, and email a high-level summary."
-        "\n\n**Required columns in the file:** `Tracking ID`, `SKU`, `Quantity`, `Return Type`"
-    )
-)
-
-# Launch the app
-if __name__ == "__main__":
-    app.launch()
+        st.error(f"Error: {e}")
